@@ -1,0 +1,18 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: ' Y4-Undergraduate-Project: "Portfolio-Optimization: A Volatility-Driven Scenario Generation Approach" '
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Stefano
+    family-names: Lema Acouri
+    email: s2156243@ed.ac.uk
+    affiliation: University of Edinburgh
+repository-code: >-
+  https://github.com/StefanoLema/Y4-Undergraduate-Project---Portfolio-Optimization--A-Volatility-Driven-Scenario-Generation-Approach
+license: MIT
+date-released: '2025-03-10'
