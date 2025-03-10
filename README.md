@@ -1,4 +1,4 @@
-This repository contains all the code and outputs of the Y4 Undergraduate "Project: Portfolio Optimization: A Volatility-Driven Scenario Generation Approach"
+This repository contains all the code and outputs of the Y4 Undergraduate Project: "Portfolio Optimization: A Volatility-Driven Scenario Generation Approach"
 
 Project Abstract:
 
