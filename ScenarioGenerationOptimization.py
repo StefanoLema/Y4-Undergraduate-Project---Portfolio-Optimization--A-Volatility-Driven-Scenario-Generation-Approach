@@ -17,7 +17,6 @@ import pandas as pd
 # For risk-free rate calculations
 from fredapi import Fred
 #fred = Fred(api_key='YOUR API KEY')
-fred = Fred(api_key='11a8de5271a9577d2518ffc0f5c33be4')
 
 # For custom scenario generation and optimization classes
 import cvxpy as cp
@@ -28,8 +27,6 @@ import scipy as sp
 # For PyportfolioOpt main optimization class
 from pypfopt import EfficientFrontier
 from pypfopt import EfficientCVaR
-
-
 
 ##############################################################
 # Functions for Periodic Volatility analysis                 #
