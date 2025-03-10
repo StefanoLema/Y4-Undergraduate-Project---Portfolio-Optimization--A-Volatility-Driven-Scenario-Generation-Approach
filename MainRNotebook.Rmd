@@ -1,0 +1,444 @@
+---
+title: "Optimal Portfolio and Benchmarking"
+author: "Stefano Lema and Yash Kumar"
+date: "2024-10-23"
+output: html_document
+---
+```{r setup, include = FALSE}
+# Set default code chunk options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  warning = FALSE, message = FALSE
+)
+theme_set(theme_bw())
+
+
+# General Functionality, basic stats
+library(tidyverse)
+library(reshape2)
+library(psych)
+library(reshape2)
+library(stats)
+
+# Financial Plots and Data Fetching Functions
+library(quantmod)
+
+# ARMA-GARCH
+library(rugarch)
+
+# Wavelet
+library(wavelets)
+
+# Vine Copula
+library(VineCopula)
+library(network)
+library(Matrix)
+
+# General plotting
+library(ggpubr)
+library(gridExtra)
+
+# Import functions
+source("Main_Functions.R")
+```
+
+## Data import and seggregation based on time horizon from python bootstrapping algorithm
+```{r data fetch, eval=TRUE, echo=FALSE}
+
+# Select symbols for data load
+symbols_list <- c("AXP",  # American Express
+    "BA",   # Boeing
+    "CAT",  # Caterpillar
+    "HD",   # Home Depot
+    "JNJ",  # Johnson & Johnson
+    "JPM",  # JPMorgan Chase
+    "KO",   # Coca-Cola
+    "MCD",  # McDonald's
+    "PG")    # Procter & Gamble
+
+# Define the full date range from the earliest start date to the latest end date
+full_start_date <- as.Date("2005-01-01")
+full_end_date <- as.Date("2025-01-01")
+
+# Load all stock data from Yahoo for the full date range
+getSymbols(symbols_list, src = 'yahoo', from = full_start_date, to = full_end_date, auto.assign = TRUE)
+
+# Store the stock data in a list
+data <- mget(symbols_list)
+
+# Compute Log-Returns of data
+log_returns <- lapply(data, function(stock) dailyReturn(Cl(stock), type = 'log'))
+
+# Reassign names to Log-Returns data
+names(log_returns) <- symbols_list
+
+# Create Log-Returns dataframe 
+returns <- do.call(merge, log_returns)
+colnames(returns) <- symbols_list
+
+extract_period <- function(index, df,  period = 251) {
+  start <- index + 2 # to match Python indexing
+  end <- start + period
+  subset_df <- df[start:end,]
+  
+  return(subset_df)
+}
+time_stamps <- read.csv("time_stamps.csv")
+# Create lists to store selections
+train_list <- list(Low_Volatility = list(), Medium_Volatility = list(), High_Volatility = list())
+test_list <- list(Low_Volatility = list(), Medium_Volatility = list(), High_Volatility = list())
+# Apply function to each index
+for (i in 1:nrow(time_stamps)) {
+  train_list$Low_Volatility[[i]] <- extract_period(time_stamps$low_volatility_dates[i], returns)
+  train_list$Medium_Volatility[[i]] <- extract_period(time_stamps$medium_volatility_dates[i], returns)
+  train_list$High_Volatility[[i]] <- extract_period(time_stamps$high_volatility_dates[i], returns)
+  
+  test_list$Low_Volatility[[i]] <- extract_period(time_stamps$low_volatility_dates[i] +252, returns, period = 20)
+  test_list$Medium_Volatility[[i]] <- extract_period(time_stamps$medium_volatility_dates[i] + 252, returns, period = 20)
+  test_list$High_Volatility[[i]] <- extract_period(time_stamps$high_volatility_dates[i] + 252, returns, period = 20)
+  
+}
+```
+```{r matching dates test}
+
+print("Confirming consecutive periods are correctly split:")
+for (i in seq_along(train_list$Low_Volatility)) {
+  last_train_index <- index(tail(train_list$Low_Volatility[[i]], 1))
+  first_test_index <- index(head(test_list$Low_Volatility[[i]], 1))
+  
+  print(paste("Train Last Index:", last_train_index, "| Test First Index:", first_test_index))
+}
+print("Consecutive periods are correctly split.")
+
+print("Confirming desired length of sub-train and validation splits")
+print(paste("Train length", dim(train_list$Low_Volatility[[1]])[1], "Test length", dim(test_list$Low_Volatility[[1]])[1]))
+```
+
+We now find optimal GARCH models across each of our Train datasets. Note that we have now restricted residual distribution choice to std.
+
+```{r garchtests}
+# Define the lists of parameters
+model_list <- c("sGARCH", "eGARCH", "gjrGARCH")
+dist_list_main <- c("std")
+arma_params_list <- list(c(0,0), c(1,0), c(0,1), c(1,1))
+test <- TRUE
+
+# Create data frame to store results
+final_results <- data.frame(Symbol = character(),
+                            AIC = character(),
+                            BIC = character(),
+                            SIC = character(),
+                            HQIC = character(),
+                            stringsAsFactors = FALSE)
+
+# Initialize a list to store mode results for each volatility type
+mode_results <- list()
+
+# Loop through each stock
+for (symbol in colnames(returns)) {
+  print(paste("Working on:", symbol))
+  
+  # Loop through each volatility type
+  for (vol_type in names(train_list)) {
+    print(paste("Currently at:", vol_type))
+    # Initialize a temporary data frame to store results for this stock and volatility type
+    stock_results <- data.frame()
+    
+    # Iterate over each sub-dataframe in the volatility type list
+    for (i in seq_along(train_list[[vol_type]])) {
+      print(i)
+      train_data <- train_list[[vol_type]][[i]]
+      
+      if (symbol %in% colnames(train_data)) {
+        data <- train_data[, symbol]
+        
+        # Use tryCatch to handle errors and warnings during model selection
+        best_models <- tryCatch(
+          {
+            ARGA_model_select(data, model_list, dist_list_main, arma_params_list, model_IC)
+          },
+          error = function(e) {
+            message("Skipping iteration due to error: ", conditionMessage(e))
+            return(NULL)  # Skip iteration if error occurs
+          },
+          warning = function(w) {
+            message("Skipping iteration due to warning: ", conditionMessage(w))
+            return(NULL)  # Skip iteration if warning occurs
+          }
+        )
+        
+        if (!is.null(best_models)) {
+          stock_results <- rbind(stock_results, data.frame(Symbol = symbol, best_models))
+        }
+      }
+    }
+    
+    # Compute the mode for each column of stock_results (excluding the Symbol column)
+    if (nrow(stock_results) > 0) {
+      stock_mode <- as.data.frame(lapply(stock_results[,-1], Mode), stringsAsFactors = FALSE)
+      stock_mode$Symbol <- symbol  # Add the stock symbol back
+      
+      # Store the mode results in a list by volatility type
+      if (!vol_type %in% names(mode_results)) {
+        mode_results[[vol_type]] <- data.frame()
+      }
+      
+      mode_results[[vol_type]] <- rbind(mode_results[[vol_type]], stock_mode)
+    }
+  }
+}
+
+# Export mode results for each volatility type
+for (vol_type in names(mode_results)) {
+  write.csv(mode_results[[vol_type]], file = paste0("Mode_Results_", vol_type, ".csv"), row.names = FALSE)
+}
+```
+
+```{r garch selection tests 2 , eval=FALSE, echo=FALSE, fig.height = 12, fig.width = 12, fig.align = "center"}
+
+
+for (i in seq_along(mode_results)){
+  # Apply the function to each row of the dataframe
+  mode_results[[i]]$Best_Model <- apply(mode_results[[i]], 1, determine_best_ic)}
+
+
+# Create the new dataframe
+Optimal_GARCH_models <- data.frame(lapply(mode_results, function(df) df[, 6]))
+
+# Extract row names from the first column of the first dataframe
+rownames(Optimal_GARCH_models) <- mode_results[[1]][, 5]
+
+# Assign custom column names
+names(Optimal_GARCH_models) <- c("Low_Volatility_Model", "Medium_Volatility_Model", "High_Volatility_Model")
+
+# View result
+print(Optimal_GARCH_models)
+write.csv(Optimal_GARCH_models, "Optimal_Garch_Models.csv", row.names = TRUE)
+
+
+```
+We consider a GARCH spec optimal if at least 3 of the 4 information criteria match. For non-matching specs we use the BIC suggested model, based on literature.
+
+We now fit the optimal model specs.
+```{r further garch inspection, eval=TRUE, echo=FALSE, fig.height = 12, fig.width = 12, fig.align = "center"}
+
+# For Low Variance Models
+
+# Extract ARMA orders
+arma_orders_str <- gsub(".*ARMA\\((\\d+), *(\\d+)\\).*", "\\1 \\2", Optimal_GARCH_models$Low_Volatility_Model)
+arma_orders_low <- lapply(strsplit(arma_orders_str, " "), as.numeric)
+
+# Extract GARCH type
+garch_type_low <- gsub(".*-(\\w+)\\(.*", "\\1", Optimal_GARCH_models$Low_Volatility_Model)
+
+# Create spec storage list
+spec_list_low <- list()
+
+for (i in seq_along(symbols_list)){
+  stock_symbol <- symbols_list[i]
+  spec <- ugarchspec(variance.model = list(model = garch_type_low[i], garchOrder = c(1, 1)),
+                        mean.model = list(armaOrder = arma_orders_low[[i]]), distribution.model = "std")
+  spec_list_low[[paste0(stock_symbol,"_spec")]] <- spec
+}
+
+
+# For Middle Variance Models
+
+# Extract ARMA orders
+arma_orders_str <- gsub(".*ARMA\\((\\d+), *(\\d+)\\).*", "\\1 \\2", Optimal_GARCH_models$Medium_Volatility_Model)
+arma_orders_medium <- lapply(strsplit(arma_orders_str, " "), as.numeric)
+
+# Extract GARCH type
+garch_type_medium <- gsub(".*-(\\w+)\\(.*", "\\1", Optimal_GARCH_models$Medium_Volatility_Model)
+
+# Create spec storage list
+spec_list_medium <- list()
+
+for (i in seq_along(symbols_list)){
+  stock_symbol <- symbols_list[i]
+  spec <- ugarchspec(variance.model = list(model = garch_type_medium[i], garchOrder = c(1, 1)),
+                        mean.model = list(armaOrder = arma_orders_medium[[i]]), distribution.model = "std")
+  spec_list_medium[[paste0(stock_symbol,"_spec")]] <- spec
+}
+
+# For High Variance Models
+
+# Extract ARMA orders
+arma_orders_str <- gsub(".*ARMA\\((\\d+), *(\\d+)\\).*", "\\1 \\2", Optimal_GARCH_models$High_Volatility_Model)
+arma_orders_high <- lapply(strsplit(arma_orders_str, " "), as.numeric)
+
+# Extract GARCH type
+garch_type_high <- gsub(".*-(\\w+)\\(.*", "\\1", Optimal_GARCH_models$High_Volatility_Model)
+
+# Create spec storage list
+spec_list_high<- list()
+
+for (i in seq_along(symbols_list)){
+  stock_symbol <- symbols_list[i]
+  spec <- ugarchspec(variance.model = list(model = garch_type_high[i], garchOrder = c(1, 1)),
+                        mean.model = list(armaOrder = arma_orders_high[[i]]), distribution.model = "std")
+  spec_list_high[[paste0(stock_symbol,"_spec")]] <- spec
+}
+
+```
+
+### Generate 21 day simulations for Training and Validation splits
+``` {r training simulations}
+
+# Compute Rolling Forecasts:
+garch_copula_simulations(train_list$Low_Volatility, test_list$Low_Volatility, spec_list_low, "Low", roll = TRUE)
+garch_copula_simulations(train_list$Medium_Volatility, test_list$Medium_Volatility, spec_list_medium, "Medium", roll = TRUE)
+garch_copula_simulations(train_list$High_Volatility, test_list$High_Volatility, spec_list_high, "High", roll = TRUE)
+
+# Compute Regular Forecasts:
+garch_copula_simulations(train_list$Low_Volatility, test_list$Low_Volatility, spec_list_low, "Low", roll = FALSE)
+garch_copula_simulations(train_list$Medium_Volatility, test_list$Medium_Volatility, spec_list_medium, "Medium", roll = FALSE)
+garch_copula_simulations(train_list$High_Volatility, test_list$High_Volatility, spec_list_high, "High", roll = FALSE)
+```
+
+### Genrate n day simulations for Out of Sample Testing
+```{r rgarcopsim test}
+
+# Load VXD data for our test horizon
+getSymbols("^VXD", src = 'yahoo', from = "2023-12-29" , to = full_end_date, auto.assign = TRUE)
+
+# Optionally, convert VXD to a data.frame for further processing
+vxd_values <- data.frame(VXD = Cl(VXD))
+
+# Quantiles as estimated in Python script
+vxd_lower_quantile <- 15.520000457763672 
+vxd_upper_quantile <- 26.424999618530283
+
+
+# Evaluate VXD value at start of testing horizon
+
+initial_volatility <- vxd_values[1,]
+initial_vol_profile <- volatility_evaluation(initial_volatility,vxd_lower_quantile,vxd_upper_quantile)
+
+print(paste("Initial volatility scenario is:", initial_vol_profile$volatility_type))
+
+
+# Split returns into final train and test splits
+
+n <- nrow(returns)
+
+# Define indices for splitting
+train_start_fl <- index(returns)[n - 252 * 2 + 1]  # Start of training
+train_end_fl <- index(returns)[n - 252]        # End of training
+test_start_fl <- train_end_fl + 1                       # Start of test
+test_end_fl <- index(returns)[n]               # End of test
+
+# Split the data
+train_data_fl <- returns[paste(train_start_fl, train_end_fl, sep = "/")]
+test_data_fl <- returns[paste(test_start_fl, test_end_fl, sep = "/")]
+
+# Define reweighting frequencies
+frequency <- c(1,2,4,6,12)
+
+
+
+for(freq in frequency){
+  if (freq == 12){
+    print("No Reweighting")
+    spec_list <- initial_vol_profile$spec 
+    # Gather the selected 252 day period for training
+    returns_train <- data.frame(train_data_fl)
+  
+    # Gather the following period for testing, length depends on reweigh frequency
+    returns_test <- data.frame(test_data_fl)
+    
+    GARCH_and_Copula_sims_testing(returns_train,returns_test, spec_list, symbols_list, freq )
+    GARCH_and_Copula_sims_testing(returns_train,returns_test, spec_list, symbols_list, freq , roll = FALSE)
+  }
+  else{
+    print(paste("Reweighting every ", freq, " Months"))
+    for (j in seq(0, nrow(test_data_fl) - 1, by = freq * 21)) {
+      # Days to train from original training set
+      train_0 <- tail(train_data_fl, 252 - j)  # Last (252 - j) rows
+      train_1 <- head(test_data_fl, j)         # First j rows
+      returns_train <- rbind(train_0, train_1)       # Combine training data
+      
+      # Define test set
+      returns_test_df <- data.frame(test_data_fl[(j + 1):min(j + freq * 21, nrow(test_data_fl))])
+      # Print test start and end indexes
+      if (j == 0) {
+        spec_list <- initial_vol_profile$spec 
+      } else {
+        # Get value of VXD at date equivalent to restructuring date
+        returns_train_first_index <- tail(index(returns_train), 1)  # Last index of train_1
+        vxd_value <- as.numeric(Cl(VXD)[returns_train_first_index])
+
+        # Evaluate volatility type
+        volatility_type <- volatility_evaluation(vxd_value, vxd_lower_quantile, vxd_upper_quantile)
+        spec_list <- volatility_type$spec 
+        
+      }
+      returns_train_df <- data.frame(returns_train)
+      GARCH_and_Copula_sims_testing(returns_train_df,returns_test_df, spec_list, symbols_list, freq, iteration = j %/% 21)
+      GARCH_and_Copula_sims_testing(returns_train_df,returns_test_df, spec_list, symbols_list, freq, iteration = j %/% 21, roll = FALSE)
+    }
+  }
+}
+```
+
+### We also plot some examples of Regular Vine Trees for samples from low, medium, and high volatility periods
+```{r vine trees, eval=TRUE, echo=FALSE, fig.height = 12, fig.width = 12, fig.align = "center"}
+# LOW VOLATILITY
+RVfit <- tree_plotter(train_list$Low_Volatility[[1]], spec_list_low)
+RVfit$names <- symbols_list
+
+# Extract copula families and tau values
+copula_names_1 <- sapply(RVfit[["family"]][9,], BiCopName, short = FALSE)
+copula_tau_1 <- round(RVfit[["tau"]][9,], 4)  
+copula_names_2 <- sapply(RVfit[["family"]][8,], BiCopName, short = FALSE)
+copula_tau_2 <- round(RVfit[["tau"]][8,], 4)  
+
+# Combine into "copula-tau" format
+low_vol_1 <- paste0(copula_names_1, "-", copula_tau_1)
+low_vol_2 <- paste0(copula_names_2, "-", copula_tau_2)
+
+# MEDIUM VOLATILITY
+RVfit <- tree_plotter(train_list$Medium_Volatility[[1]], spec_list_medium)
+RVfit$names <- symbols_list
+
+# Extract copula families and tau values
+copula_names_1 <- sapply(RVfit[["family"]][9,], BiCopName, short = FALSE)
+copula_tau_1 <- round(RVfit[["tau"]][9,], 4)  
+copula_names_2 <- sapply(RVfit[["family"]][8,], BiCopName, short = FALSE)
+copula_tau_2 <- round(RVfit[["tau"]][8,], 4)  
+
+# Combine into "copula-tau" format
+med_vol_1 <- paste0(copula_names_1, "-", copula_tau_1)
+med_vol_2 <- paste0(copula_names_2, "-", copula_tau_2)
+
+# HIGH VOLATILITY
+RVfit <- tree_plotter(train_list$High_Volatility[[2]], spec_list_high)
+RVfit$names <- symbols_list
+
+# Extract copula families and tau values
+copula_names_1 <- sapply(RVfit[["family"]][9,], BiCopName, short = FALSE)
+copula_tau_1 <- round(RVfit[["tau"]][9,], 4)  
+copula_names_2 <- sapply(RVfit[["family"]][8,], BiCopName, short = FALSE)
+copula_tau_2 <- round(RVfit[["tau"]][8,], 4)  
+
+# Combine into "copula-tau" format
+high_vol_1 <- paste0(copula_names_1, "-", copula_tau_1)
+high_vol_2 <- paste0(copula_names_2, "-", copula_tau_2)
+
+# CREATE FINAL DATAFRAME
+copula_df <- data.frame(
+  Low_Vol_1 = low_vol_1,
+  Low_Vol_2 = low_vol_2,
+  Med_Vol_1 = med_vol_1,
+  Med_Vol_2 = med_vol_2,
+  High_Vol_1 = high_vol_1,
+  High_Vol_2 = high_vol_2
+)
+
+write.csv(copula_df, file = "Copula Families.csv")
+
+```
+
+
+
